@@ -151,8 +151,8 @@ Bun.serve({
       // 如果解析出的 baseURL 包含 /v1，SDK 可能会重复拼接，这里假设用户传入的是域名或根路径
       // 通常 Anthropic 的 baseURL 是 https://api.anthropic.com
       const client = new Anthropic({
-        apiKey: apiKey,
-        baseURL: baseURL,
+        apiKey,
+        baseURL,
       });
 
       // 4. 解析请求体
