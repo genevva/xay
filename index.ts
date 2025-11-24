@@ -1,9 +1,9 @@
 import { Anthropic } from "@anthropic-ai/sdk";
 
-console.log("🔥 Max Proxy is running on port 3000...");
+console.log("🔥 Max Proxy is running on port 8000...");
 
 Bun.serve({
-  port: 3000,
+  port: 8000,
   async fetch(req) {
     // 仅处理 POST 请求
     if (req.method !== "POST") {
