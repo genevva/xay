@@ -1,125 +1,151 @@
-import { Anthropic } from "@anthropic-ai/sdk";
+// server.ts
+import Anthropic from "@anthropic-ai/sdk";
 
-console.log("🔥 Max Proxy is running on port 8000...");
+type AnthropicConfig = {
+  apiKey: string;
+  baseURL: string;
+};
 
-Bun.serve({
-  port: 8000,
-  async fetch(req) {
-    // 仅处理 POST 请求
-    if (req.method !== "POST") {
-      return new Response("Method Not Allowed", { status: 405 });
+/**
+ * 从 HTTP 请求头中提取 Anthropic 配置信息：
+ * - 遍历所有 header，大小写不敏感匹配 `authorization` 或 `x-api-key`
+ * - 值中必须包含关键字 `cc:`
+ * - 取 `cc:` 之后的部分，以第一个 `!` 分隔：
+ *   - 左：apiKey
+ *   - 右：baseURL
+ */
+function extractAnthropicConfig(headers: Headers): AnthropicConfig | null {
+  let rawHeaderValue: string | null = null;
+
+  // 遍历所有 header，保证大小写不敏感
+  for (const [key, value] of headers) {
+    const lowerKey = key.toLowerCase();
+    if (lowerKey === "authorization" || lowerKey === "x-api-key") {
+      if (value && value.includes("cc:")) {
+        rawHeaderValue = value;
+        break;
+      }
     }
+  }
 
-    try {
-      // 1. 凭据与上游地址解析逻辑
-      let anthropicApiKey: string | undefined;
-      let anthropicBaseUrl: string | undefined;
+  if (!rawHeaderValue) return null;
 
-      // 遍历 Headers，忽略大小写
-      for (const [key, value] of req.headers.entries()) {
-        const lowerKey = key.toLowerCase();
+  const ccIndex = rawHeaderValue.indexOf("cc:");
+  if (ccIndex === -1) return null;
 
-        // 匹配 Authorization 或 x-api-key
-        if (lowerKey === "authorization" || lowerKey === "x-api-key") {
-          if (value && value.includes("cc:")) {
-            // 截取 "cc:" 之后的内容
-            // 使用 split 切分一次，防止 token 中也有 cc: 导致错误（虽然极少见）
-            const afterCc = value.substring(value.indexOf("cc:") + 3).trim();
+  // 取出 "cc:" 之后的内容
+  const configPart = rawHeaderValue.slice(ccIndex + 3).trim();
+  if (!configPart) return null;
 
-            // 尝试用第一个 "!" 进行切分
-            const firstExclamationIndex = afterCc.indexOf("!");
+  // 按第一个 "!" 分割
+  const bangIndex = configPart.indexOf("!");
+  if (bangIndex === -1) return null;
 
-            if (firstExclamationIndex !== -1) {
-              // 切分成功
-              const extractedToken = afterCc.substring(0, firstExclamationIndex);
-              const extractedUrl = afterCc.substring(firstExclamationIndex + 1);
+  const apiKey = configPart.slice(0, bangIndex).trim();
+  const baseURL = configPart.slice(bangIndex + 1).trim();
 
-              if (extractedToken && extractedUrl) {
-                anthropicApiKey = extractedToken;
-                anthropicBaseUrl = extractedUrl;
-                // 找到有效凭据后跳出循环
-                break;
-              }
-            }
-          }
-        }
-      }
+  if (!apiKey || !baseURL) return null;
 
-      // 验证是否获取到了必要的配置
-      if (!anthropicApiKey || !anthropicBaseUrl) {
-        return new Response(
-          JSON.stringify({
-            error: {
-              type: "authentication_error",
-              message: "Missing or invalid credentials format (cc:token!url)",
-            },
-          }),
-          { status: 401, headers: { "Content-Type": "application/json" } }
-        );
-      }
+  return { apiKey, baseURL };
+}
 
-      // 2. 解析请求体
-      const body = await req.json();
+// Bun 服务器，暴露 Claude Messages API 兼容的端点
+const server = Bun.serve({
+  port: 8000,
+  async fetch(req: Request): Promise<Response> {
+    const url = new URL(req.url);
 
-      // 3. 初始化 Anthropic 客户端 (针对当前请求)
-      const client = new Anthropic({
-        apiKey: anthropicApiKey,
-        baseURL: anthropicBaseUrl,
-      });
-
-      // 4. 转发请求逻辑
-      // 检查是否开启流式传输
-      const isStreaming = body.stream === true;
-
-      if (isStreaming) {
-        // 创建流式请求
-        const stream = await client.messages.create(body);
-
-        // 将 SDK 的 AsyncIterable 转换为 Web ReadableStream
-        const readable = new ReadableStream({
-          async start(controller) {
-            for await (const chunk of stream) {
-              // SDK 返回的是对象，需要转回 SSE 格式的字符串或者直接传 JSON 块
-              // Claude SDK 的流返回的是一个个 MessageStreamEvent
-              // 为了保持标准的 SSE 格式，我们需要手动构造 event data
-              const eventText = `event: ${chunk.type}\ndata: ${JSON.stringify(chunk)}\n\n`;
-              controller.enqueue(new TextEncoder().encode(eventText));
-            }
-            controller.close();
-          },
-        });
-
-        return new Response(readable, {
-          headers: {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-          },
-        });
-      } else {
-        // 普通请求
-        const message = await client.messages.create(body);
-        return Response.json(message);
-      }
-
-    } catch (error: any) {
-      // 错误处理
-      console.error("Proxy Error:", error);
-      
-      // 尝试返回 Anthropic 风格的错误结构
+    // 只处理 POST /v1/messages
+    if (req.method !== "POST" || url.pathname !== "/v1/messages") {
       return new Response(
         JSON.stringify({
-          type: "error",
           error: {
-            type: "api_error",
-            message: error.message || "Internal Server Error",
+            type: "invalid_request_error",
+            message: "Only POST /v1/messages is supported by this proxy.",
           },
         }),
-        { 
-            status: error.status || 500, 
-            headers: { "Content-Type": "application/json" } 
-        }
+        {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        },
+      );
+    }
+
+    // 从 Header 中提取 apiKey 和 baseURL
+    const cfg = extractAnthropicConfig(req.headers);
+    if (!cfg) {
+      return new Response(
+        JSON.stringify({
+          error: {
+            type: "authentication_error",
+            message:
+              'Missing or invalid credentials. Expected "cc:<ANTHROPIC_AUTH_TOKEN>!<ANTHROPIC_BASE_URL>" in Authorization or X-API-Key header.',
+          },
+        }),
+        {
+          status: 401,
+          headers: { "content-type": "application/json" },
+        },
+      );
+    }
+
+    let body: any;
+    try {
+      body = await req.json(); // 直接转发 Claude Messages API 请求体
+    } catch {
+      return new Response(
+        JSON.stringify({
+          error: {
+            type: "invalid_request_error",
+            message: "Request body must be valid JSON.",
+          },
+        }),
+        {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        },
+      );
+    }
+
+    // 创建 Anthropic 客户端，使用上游地址和凭据
+    const client = new Anthropic({
+      apiKey: cfg.apiKey,
+      baseURL: cfg.baseURL, // 例如：https://api.anthropic.com
+    });
+
+    try {
+      // 直接调用 Claude Messages API（非流式）
+      const upstreamResp = await client.messages.create(body as any);
+
+      return new Response(JSON.stringify(upstreamResp), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+        },
+      });
+    } catch (err: any) {
+      console.error("Upstream Anthropic error:", err);
+
+      const status = typeof err?.status === "number" ? err.status : 500;
+      const message =
+        err?.message ||
+        err?.error?.message ||
+        "Upstream Anthropic request failed.";
+
+      return new Response(
+        JSON.stringify({
+          error: {
+            type: "upstream_error",
+            message,
+          },
+        }),
+        {
+          status,
+          headers: { "content-type": "application/json" },
+        },
       );
     }
   },
 });
+
+console.log(`Claude Messages proxy listening on http://localhost:${server.port}`);
